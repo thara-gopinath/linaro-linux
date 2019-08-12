@@ -167,12 +167,16 @@ struct tlb_state {
 	 */
 	struct mm_struct *loaded_mm;
 
-#define LOADED_MM_SWITCHING ((struct mm_struct *)1)
+#define LOADED_MM_SWITCHING ((struct mm_struct *)1UL)
+
+	/* Last user mm for optimizing IBPB */
+	union {
+		struct mm_struct	*last_user_mm;
+		unsigned long		last_user_mm_ibpb;
+	};
 
 	u16 loaded_mm_asid;
 	u16 next_asid;
-	/* last user mm's ctx id */
-	u64 last_ctx_id;
 
 	/*
 	 * We can be in one of several states:
@@ -269,6 +273,8 @@ static inline bool nmi_uaccess_okay(void)
 
 	return true;
 }
+
+#define nmi_uaccess_okay nmi_uaccess_okay
 
 /* Initialize cr4 shadow for this CPU. */
 static inline void cr4_init_shadow(void)

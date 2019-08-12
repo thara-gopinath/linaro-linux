@@ -20,8 +20,11 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  *
  */
+
 #include <linux/firmware.h>
-#include <drm/drmP.h>
+#include <linux/module.h>
+#include <linux/pci.h>
+
 #include <drm/drm_cache.h>
 #include "amdgpu.h"
 #include "gmc_v8_0.h"
@@ -56,6 +59,9 @@ MODULE_FIRMWARE("amdgpu/tonga_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris11_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris10_mc.bin");
 MODULE_FIRMWARE("amdgpu/polaris12_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris11_k_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris10_k_mc.bin");
+MODULE_FIRMWARE("amdgpu/polaris12_k_mc.bin");
 
 static const u32 golden_settings_tonga_a11[] =
 {
@@ -224,13 +230,39 @@ static int gmc_v8_0_init_microcode(struct amdgpu_device *adev)
 		chip_name = "tonga";
 		break;
 	case CHIP_POLARIS11:
-		chip_name = "polaris11";
+		if (((adev->pdev->device == 0x67ef) &&
+		     ((adev->pdev->revision == 0xe0) ||
+		      (adev->pdev->revision == 0xe5))) ||
+		    ((adev->pdev->device == 0x67ff) &&
+		     ((adev->pdev->revision == 0xcf) ||
+		      (adev->pdev->revision == 0xef) ||
+		      (adev->pdev->revision == 0xff))))
+			chip_name = "polaris11_k";
+		else if ((adev->pdev->device == 0x67ef) &&
+			 (adev->pdev->revision == 0xe2))
+			chip_name = "polaris11_k";
+		else
+			chip_name = "polaris11";
 		break;
 	case CHIP_POLARIS10:
-		chip_name = "polaris10";
+		if ((adev->pdev->device == 0x67df) &&
+		    ((adev->pdev->revision == 0xe1) ||
+		     (adev->pdev->revision == 0xf7)))
+			chip_name = "polaris10_k";
+		else
+			chip_name = "polaris10";
 		break;
 	case CHIP_POLARIS12:
-		chip_name = "polaris12";
+		if (((adev->pdev->device == 0x6987) &&
+		     ((adev->pdev->revision == 0xc0) ||
+		      (adev->pdev->revision == 0xc3))) ||
+		    ((adev->pdev->device == 0x6981) &&
+		     ((adev->pdev->revision == 0x00) ||
+		      (adev->pdev->revision == 0x01) ||
+		      (adev->pdev->revision == 0x10))))
+			chip_name = "polaris12_k";
+		else
+			chip_name = "polaris12";
 		break;
 	case CHIP_FIJI:
 	case CHIP_CARRIZO:
@@ -260,7 +292,7 @@ out:
  *
  * @adev: amdgpu_device pointer
  *
- * Load the GDDR MC ucode into the hw (CIK).
+ * Load the GDDR MC ucode into the hw (VI).
  * Returns 0 on success, error on failure.
  */
 static int gmc_v8_0_tonga_mc_load_microcode(struct amdgpu_device *adev)
@@ -337,7 +369,7 @@ static int gmc_v8_0_polaris_mc_load_microcode(struct amdgpu_device *adev)
 	const struct mc_firmware_header_v1_0 *hdr;
 	const __le32 *fw_data = NULL;
 	const __le32 *io_mc_regs = NULL;
-	u32 data, vbios_version;
+	u32 data;
 	int i, ucode_size, regs_size;
 
 	/* Skip MC ucode loading on SR-IOV capable boards.
@@ -346,13 +378,6 @@ static int gmc_v8_0_polaris_mc_load_microcode(struct amdgpu_device *adev)
 	 * for this adaptor.
 	 */
 	if (amdgpu_sriov_bios(adev))
-		return 0;
-
-	WREG32(mmMC_SEQ_IO_DEBUG_INDEX, 0x9F);
-	data = RREG32(mmMC_SEQ_IO_DEBUG_DATA);
-	vbios_version = data & 0xf;
-
-	if (vbios_version == 0)
 		return 0;
 
 	if (!adev->gmc.fw)
@@ -411,7 +436,7 @@ static void gmc_v8_0_vram_gtt_location(struct amdgpu_device *adev,
 		base = RREG32(mmMC_VM_FB_LOCATION) & 0xFFFF;
 	base <<= 24;
 
-	amdgpu_gmc_vram_location(adev, &adev->gmc, base);
+	amdgpu_gmc_vram_location(adev, mc, base);
 	amdgpu_gmc_gart_location(adev, mc);
 }
 
@@ -421,7 +446,7 @@ static void gmc_v8_0_vram_gtt_location(struct amdgpu_device *adev,
  * @adev: amdgpu_device pointer
  *
  * Set the location of vram, gart, and AGP in the GPU's
- * physical address space (CIK).
+ * physical address space (VI).
  */
 static void gmc_v8_0_mc_program(struct amdgpu_device *adev)
 {
@@ -493,7 +518,7 @@ static void gmc_v8_0_mc_program(struct amdgpu_device *adev)
  * @adev: amdgpu_device pointer
  *
  * Look up the amount of vram, vram width, and decide how to place
- * vram and gart within the GPU's physical address space (CIK).
+ * vram and gart within the GPU's physical address space (VI).
  * Returns 0 for success.
  */
 static int gmc_v8_0_mc_init(struct amdgpu_device *adev)
@@ -608,10 +633,10 @@ static int gmc_v8_0_mc_init(struct amdgpu_device *adev)
  * @adev: amdgpu_device pointer
  * @vmid: vm instance to flush
  *
- * Flush the TLB for the requested page table (CIK).
+ * Flush the TLB for the requested page table (VI).
  */
 static void gmc_v8_0_flush_gpu_tlb(struct amdgpu_device *adev,
-					uint32_t vmid)
+				uint32_t vmid, uint32_t flush_type)
 {
 	/* bits 0-15 are the VM contexts0-15 */
 	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
@@ -640,50 +665,26 @@ static void gmc_v8_0_emit_pasid_mapping(struct amdgpu_ring *ring, unsigned vmid,
 	amdgpu_ring_emit_wreg(ring, mmIH_VMID_0_LUT + vmid, pasid);
 }
 
-/**
- * gmc_v8_0_set_pte_pde - update the page tables using MMIO
+/*
+ * PTE format on VI:
+ * 63:40 reserved
+ * 39:12 4k physical page base address
+ * 11:7 fragment
+ * 6 write
+ * 5 read
+ * 4 exe
+ * 3 reserved
+ * 2 snooped
+ * 1 system
+ * 0 valid
  *
- * @adev: amdgpu_device pointer
- * @cpu_pt_addr: cpu address of the page table
- * @gpu_page_idx: entry in the page table to update
- * @addr: dst addr to write into pte/pde
- * @flags: access flags
- *
- * Update the page tables using the CPU.
+ * PDE format on VI:
+ * 63:59 block fragment size
+ * 58:40 reserved
+ * 39:1 physical base address of PTE
+ * bits 5:1 must be 0.
+ * 0 valid
  */
-static int gmc_v8_0_set_pte_pde(struct amdgpu_device *adev, void *cpu_pt_addr,
-				uint32_t gpu_page_idx, uint64_t addr,
-				uint64_t flags)
-{
-	void __iomem *ptr = (void *)cpu_pt_addr;
-	uint64_t value;
-
-	/*
-	 * PTE format on VI:
-	 * 63:40 reserved
-	 * 39:12 4k physical page base address
-	 * 11:7 fragment
-	 * 6 write
-	 * 5 read
-	 * 4 exe
-	 * 3 reserved
-	 * 2 snooped
-	 * 1 system
-	 * 0 valid
-	 *
-	 * PDE format on VI:
-	 * 63:59 block fragment size
-	 * 58:40 reserved
-	 * 39:1 physical base address of PTE
-	 * bits 5:1 must be 0.
-	 * 0 valid
-	 */
-	value = addr & 0x000000FFFFFFF000ULL;
-	value |= flags;
-	writeq(value, ptr + (gpu_page_idx * 8));
-
-	return 0;
-}
 
 static uint64_t gmc_v8_0_get_vm_pte_flags(struct amdgpu_device *adev,
 					  uint32_t flags)
@@ -802,7 +803,7 @@ static void gmc_v8_0_set_prt(struct amdgpu_device *adev, bool enable)
  * This sets up the TLBs, programs the page tables for VMID0,
  * sets up the hw for VMIDs 1-15 which are allocated on
  * demand, and sets up the global locations for the LDS, GDS,
- * and GPUVM for FSA64 clients (CIK).
+ * and GPUVM for FSA64 clients (VI).
  * Returns 0 for success, errors for failure.
  */
 static int gmc_v8_0_gart_enable(struct amdgpu_device *adev)
@@ -920,7 +921,7 @@ static int gmc_v8_0_gart_enable(struct amdgpu_device *adev)
 	else
 		gmc_v8_0_set_fault_enable_default(adev, true);
 
-	gmc_v8_0_flush_gpu_tlb(adev, 0);
+	gmc_v8_0_flush_gpu_tlb(adev, 0, 0);
 	DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
 		 (unsigned)(adev->gmc.gart_size >> 20),
 		 (unsigned long long)table_addr);
@@ -950,7 +951,7 @@ static int gmc_v8_0_gart_init(struct amdgpu_device *adev)
  *
  * @adev: amdgpu_device pointer
  *
- * This disables all VM page table (CIK).
+ * This disables all VM page table (VI).
  */
 static void gmc_v8_0_gart_disable(struct amdgpu_device *adev)
 {
@@ -980,7 +981,7 @@ static void gmc_v8_0_gart_disable(struct amdgpu_device *adev)
  * @status: VM_CONTEXT1_PROTECTION_FAULT_STATUS register value
  * @addr: VM_CONTEXT1_PROTECTION_FAULT_ADDR register value
  *
- * Print human readable fault information (CIK).
+ * Print human readable fault information (VI).
  */
 static void gmc_v8_0_vm_decode_fault(struct amdgpu_device *adev, u32 status,
 				     u32 addr, u32 mc_client, unsigned pasid)
@@ -1133,7 +1134,7 @@ static int gmc_v8_0_sw_init(void *handle)
 		pci_set_consistent_dma_mask(adev->pdev, DMA_BIT_MASK(32));
 		pr_warn("amdgpu: No coherent DMA available\n");
 	}
-	adev->need_swiotlb = drm_get_max_iomem() > ((u64)1 << dma_bits);
+	adev->need_swiotlb = drm_need_swiotlb(dma_bits);
 
 	r = gmc_v8_0_init_microcode(adev);
 	if (r) {
@@ -1449,8 +1450,9 @@ static int gmc_v8_0_process_interrupt(struct amdgpu_device *adev,
 		gmc_v8_0_set_fault_enable_default(adev, false);
 
 	if (printk_ratelimit()) {
-		struct amdgpu_task_info task_info = { 0 };
+		struct amdgpu_task_info task_info;
 
+		memset(&task_info, 0, sizeof(struct amdgpu_task_info));
 		amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
 
 		dev_err(adev->dev, "GPU fault detected: %d 0x%08x for process %s pid %d thread %s pid %d\n",
@@ -1720,7 +1722,6 @@ static const struct amdgpu_gmc_funcs gmc_v8_0_gmc_funcs = {
 	.flush_gpu_tlb = gmc_v8_0_flush_gpu_tlb,
 	.emit_flush_gpu_tlb = gmc_v8_0_emit_flush_gpu_tlb,
 	.emit_pasid_mapping = gmc_v8_0_emit_pasid_mapping,
-	.set_pte_pde = gmc_v8_0_set_pte_pde,
 	.set_prt = gmc_v8_0_set_prt,
 	.get_vm_pte_flags = gmc_v8_0_get_vm_pte_flags,
 	.get_vm_pde = gmc_v8_0_get_vm_pde

@@ -241,8 +241,8 @@ static int stm_thermal_read_factory_settings(struct stm_thermal_sensor *sensor)
 		sensor->t0 = TS1_T0_VAL1;
 
 	/* Retrieve fmt0 and put it on Hz */
-	sensor->fmt0 = ADJUST * readl_relaxed(sensor->base + DTS_T0VALR1_OFFSET)
-					      & TS1_FMT0_MASK;
+	sensor->fmt0 = ADJUST * (readl_relaxed(sensor->base +
+				 DTS_T0VALR1_OFFSET) & TS1_FMT0_MASK);
 
 	/* Retrieve ramp coefficient */
 	sensor->ramp_coeff = readl_relaxed(sensor->base + DTS_RAMPVALR_OFFSET) &
@@ -532,6 +532,10 @@ static int stm_thermal_prepare(struct stm_thermal_sensor *sensor)
 	if (ret)
 		return ret;
 
+	ret = stm_thermal_read_factory_settings(sensor);
+	if (ret)
+		goto thermal_unprepare;
+
 	ret = stm_thermal_calibration(sensor);
 	if (ret)
 		goto thermal_unprepare;
@@ -566,8 +570,7 @@ thermal_unprepare:
 static int stm_thermal_suspend(struct device *dev)
 {
 	int ret;
-	struct platform_device *pdev = to_platform_device(dev);
-	struct stm_thermal_sensor *sensor = platform_get_drvdata(pdev);
+	struct stm_thermal_sensor *sensor = dev_get_drvdata(dev);
 
 	ret = stm_thermal_sensor_off(sensor);
 	if (ret)
@@ -581,8 +584,7 @@ static int stm_thermal_suspend(struct device *dev)
 static int stm_thermal_resume(struct device *dev)
 {
 	int ret;
-	struct platform_device *pdev = to_platform_device(dev);
-	struct stm_thermal_sensor *sensor = platform_get_drvdata(pdev);
+	struct stm_thermal_sensor *sensor = dev_get_drvdata(dev);
 
 	ret = stm_thermal_prepare(sensor);
 	if (ret)
@@ -635,10 +637,6 @@ static int stm_thermal_probe(struct platform_device *pdev)
 
 	/* Populate sensor */
 	sensor->base = base;
-
-	ret = stm_thermal_read_factory_settings(sensor);
-	if (ret)
-		return ret;
 
 	sensor->clk = devm_clk_get(&pdev->dev, "pclk");
 	if (IS_ERR(sensor->clk)) {

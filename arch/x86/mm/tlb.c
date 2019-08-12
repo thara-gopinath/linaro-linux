@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include <linux/init.h>
 
 #include <linux/mm.h>
@@ -7,7 +8,6 @@
 #include <linux/export.h>
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
-#include <linux/ptrace.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -15,6 +15,8 @@
 #include <asm/cache.h>
 #include <asm/apic.h>
 #include <asm/uv/uv.h>
+
+#include "mm_internal.h"
 
 /*
  *	TLB flushing, formerly SMP-only
@@ -29,6 +31,12 @@
  *
  *	Implement flush IPI by CALL_FUNCTION_VECTOR, Alex Shi
  */
+
+/*
+ * Use bit 0 to mangle the TIF_SPEC_IB state into the mm pointer which is
+ * stored in cpu_tlb_state.last_user_mm_ibpb.
+ */
+#define LAST_USER_MM_IBPB	0x1UL
 
 /*
  * We get here when we do something requiring a TLB invalidation
@@ -181,17 +189,87 @@ static void sync_current_stack_to_mm(struct mm_struct *mm)
 	}
 }
 
-static bool ibpb_needed(struct task_struct *tsk, u64 last_ctx_id)
+static inline unsigned long mm_mangle_tif_spec_ib(struct task_struct *next)
 {
+	unsigned long next_tif = task_thread_info(next)->flags;
+	unsigned long ibpb = (next_tif >> TIF_SPEC_IB) & LAST_USER_MM_IBPB;
+
+	return (unsigned long)next->mm | ibpb;
+}
+
+static void cond_ibpb(struct task_struct *next)
+{
+	if (!next || !next->mm)
+		return;
+
 	/*
-	 * Check if the current (previous) task has access to the memory
-	 * of the @tsk (next) task. If access is denied, make sure to
-	 * issue a IBPB to stop user->user Spectre-v2 attacks.
-	 *
-	 * Note: __ptrace_may_access() returns 0 or -ERRNO.
+	 * Both, the conditional and the always IBPB mode use the mm
+	 * pointer to avoid the IBPB when switching between tasks of the
+	 * same process. Using the mm pointer instead of mm->context.ctx_id
+	 * opens a hypothetical hole vs. mm_struct reuse, which is more or
+	 * less impossible to control by an attacker. Aside of that it
+	 * would only affect the first schedule so the theoretically
+	 * exposed data is not really interesting.
 	 */
-	return (tsk && tsk->mm && tsk->mm->context.ctx_id != last_ctx_id &&
-		ptrace_may_access_sched(tsk, PTRACE_MODE_SPEC_IBPB));
+	if (static_branch_likely(&switch_mm_cond_ibpb)) {
+		unsigned long prev_mm, next_mm;
+
+		/*
+		 * This is a bit more complex than the always mode because
+		 * it has to handle two cases:
+		 *
+		 * 1) Switch from a user space task (potential attacker)
+		 *    which has TIF_SPEC_IB set to a user space task
+		 *    (potential victim) which has TIF_SPEC_IB not set.
+		 *
+		 * 2) Switch from a user space task (potential attacker)
+		 *    which has TIF_SPEC_IB not set to a user space task
+		 *    (potential victim) which has TIF_SPEC_IB set.
+		 *
+		 * This could be done by unconditionally issuing IBPB when
+		 * a task which has TIF_SPEC_IB set is either scheduled in
+		 * or out. Though that results in two flushes when:
+		 *
+		 * - the same user space task is scheduled out and later
+		 *   scheduled in again and only a kernel thread ran in
+		 *   between.
+		 *
+		 * - a user space task belonging to the same process is
+		 *   scheduled in after a kernel thread ran in between
+		 *
+		 * - a user space task belonging to the same process is
+		 *   scheduled in immediately.
+		 *
+		 * Optimize this with reasonably small overhead for the
+		 * above cases. Mangle the TIF_SPEC_IB bit into the mm
+		 * pointer of the incoming task which is stored in
+		 * cpu_tlbstate.last_user_mm_ibpb for comparison.
+		 */
+		next_mm = mm_mangle_tif_spec_ib(next);
+		prev_mm = this_cpu_read(cpu_tlbstate.last_user_mm_ibpb);
+
+		/*
+		 * Issue IBPB only if the mm's are different and one or
+		 * both have the IBPB bit set.
+		 */
+		if (next_mm != prev_mm &&
+		    (next_mm | prev_mm) & LAST_USER_MM_IBPB)
+			indirect_branch_prediction_barrier();
+
+		this_cpu_write(cpu_tlbstate.last_user_mm_ibpb, next_mm);
+	}
+
+	if (static_branch_unlikely(&switch_mm_always_ibpb)) {
+		/*
+		 * Only flush when switching to a user space task with a
+		 * different context than the user space task which ran
+		 * last on this CPU.
+		 */
+		if (this_cpu_read(cpu_tlbstate.last_user_mm) != next->mm) {
+			indirect_branch_prediction_barrier();
+			this_cpu_write(cpu_tlbstate.last_user_mm, next->mm);
+		}
+	}
 }
 
 void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
@@ -292,22 +370,12 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		new_asid = prev_asid;
 		need_flush = true;
 	} else {
-		u64 last_ctx_id = this_cpu_read(cpu_tlbstate.last_ctx_id);
-
 		/*
 		 * Avoid user/user BTB poisoning by flushing the branch
 		 * predictor when switching between processes. This stops
 		 * one process from doing Spectre-v2 attacks on another.
-		 *
-		 * As an optimization, flush indirect branches only when
-		 * switching into a processes that can't be ptrace by the
-		 * current one (as in such case, attacker has much more
-		 * convenient way how to tamper with the next process than
-		 * branch buffer poisoning).
 		 */
-		if (static_cpu_has(X86_FEATURE_USE_IBPB) &&
-				ibpb_needed(tsk, last_ctx_id))
-			indirect_branch_prediction_barrier();
+		cond_ibpb(tsk);
 
 		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
 			/*
@@ -364,14 +432,6 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		/* See above wrt _rcuidle. */
 		trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
-
-	/*
-	 * Record last user mm's context id, so we can avoid
-	 * flushing branch buffer with IBPB if we switch back
-	 * to the same user.
-	 */
-	if (next != &init_mm)
-		this_cpu_write(cpu_tlbstate.last_ctx_id, next->context.ctx_id);
 
 	/* Make sure we write CR3 before loaded_mm. */
 	barrier();
@@ -441,7 +501,7 @@ void initialize_tlbstate_and_flush(void)
 	write_cr3(build_cr3(mm->pgd, 0));
 
 	/* Reinitialize tlbstate. */
-	this_cpu_write(cpu_tlbstate.last_ctx_id, mm->context.ctx_id);
+	this_cpu_write(cpu_tlbstate.last_user_mm_ibpb, LAST_USER_MM_IBPB);
 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, 0);
 	this_cpu_write(cpu_tlbstate.next_asid, 1);
 	this_cpu_write(cpu_tlbstate.ctxs[0].ctx_id, mm->context.ctx_id);
@@ -575,7 +635,7 @@ static void flush_tlb_func_common(const struct flush_tlb_info *f,
 	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
 }
 
-static void flush_tlb_func_local(void *info, enum tlb_flush_reason reason)
+static void flush_tlb_func_local(const void *info, enum tlb_flush_reason reason)
 {
 	const struct flush_tlb_info *f = info;
 
@@ -626,9 +686,6 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 		 * that UV should be updated so that smp_call_function_many(),
 		 * etc, are optimal on UV.
 		 */
-		unsigned int cpu;
-
-		cpu = smp_processor_id();
 		cpumask = uv_flush_tlb_others(cpumask, info);
 		if (cpumask)
 			smp_call_function_many(cpumask, flush_tlb_func_remote,
@@ -655,7 +712,7 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
 }
 
 /*
- * See Documentation/x86/tlb.txt for details.  We choose 33
+ * See Documentation/x86/tlb.rst for details.  We choose 33
  * because it is large enough to cover the vast majority (at
  * least 95%) of allocations, and is small enough that we are
  * confident it will not cause too much overhead.  Each single
@@ -664,45 +721,83 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
  *
  * This is in units of pages.
  */
-static unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
+
+static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
+
+#ifdef CONFIG_DEBUG_VM
+static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
+#endif
+
+static inline struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+			unsigned long start, unsigned long end,
+			unsigned int stride_shift, bool freed_tables,
+			u64 new_tlb_gen)
+{
+	struct flush_tlb_info *info = this_cpu_ptr(&flush_tlb_info);
+
+#ifdef CONFIG_DEBUG_VM
+	/*
+	 * Ensure that the following code is non-reentrant and flush_tlb_info
+	 * is not overwritten. This means no TLB flushing is initiated by
+	 * interrupt handlers and machine-check exception handlers.
+	 */
+	BUG_ON(this_cpu_inc_return(flush_tlb_info_idx) != 1);
+#endif
+
+	info->start		= start;
+	info->end		= end;
+	info->mm		= mm;
+	info->stride_shift	= stride_shift;
+	info->freed_tables	= freed_tables;
+	info->new_tlb_gen	= new_tlb_gen;
+
+	return info;
+}
+
+static inline void put_flush_tlb_info(void)
+{
+#ifdef CONFIG_DEBUG_VM
+	/* Complete reentrency prevention checks */
+	barrier();
+	this_cpu_dec(flush_tlb_info_idx);
+#endif
+}
 
 void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 				unsigned long end, unsigned int stride_shift,
 				bool freed_tables)
 {
+	struct flush_tlb_info *info;
+	u64 new_tlb_gen;
 	int cpu;
-
-	struct flush_tlb_info info __aligned(SMP_CACHE_BYTES) = {
-		.mm = mm,
-		.stride_shift = stride_shift,
-		.freed_tables = freed_tables,
-	};
 
 	cpu = get_cpu();
 
-	/* This is also a barrier that synchronizes with switch_mm(). */
-	info.new_tlb_gen = inc_mm_tlb_gen(mm);
-
 	/* Should we flush just the requested range? */
-	if ((end != TLB_FLUSH_ALL) &&
-	    ((end - start) >> stride_shift) <= tlb_single_page_flush_ceiling) {
-		info.start = start;
-		info.end = end;
-	} else {
-		info.start = 0UL;
-		info.end = TLB_FLUSH_ALL;
+	if ((end == TLB_FLUSH_ALL) ||
+	    ((end - start) >> stride_shift) > tlb_single_page_flush_ceiling) {
+		start = 0;
+		end = TLB_FLUSH_ALL;
 	}
 
+	/* This is also a barrier that synchronizes with switch_mm(). */
+	new_tlb_gen = inc_mm_tlb_gen(mm);
+
+	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
+				  new_tlb_gen);
+
 	if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
-		VM_WARN_ON(irqs_disabled());
+		lockdep_assert_irqs_enabled();
 		local_irq_disable();
-		flush_tlb_func_local(&info, TLB_LOCAL_MM_SHOOTDOWN);
+		flush_tlb_func_local(info, TLB_LOCAL_MM_SHOOTDOWN);
 		local_irq_enable();
 	}
 
 	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids)
-		flush_tlb_others(mm_cpumask(mm), &info);
+		flush_tlb_others(mm_cpumask(mm), info);
 
+	put_flush_tlb_info();
 	put_cpu();
 }
 
@@ -731,38 +826,48 @@ static void do_kernel_range_flush(void *info)
 
 void flush_tlb_kernel_range(unsigned long start, unsigned long end)
 {
-
 	/* Balance as user space task's flush, a bit conservative */
 	if (end == TLB_FLUSH_ALL ||
 	    (end - start) > tlb_single_page_flush_ceiling << PAGE_SHIFT) {
 		on_each_cpu(do_flush_tlb_all, NULL, 1);
 	} else {
-		struct flush_tlb_info info;
-		info.start = start;
-		info.end = end;
-		on_each_cpu(do_kernel_range_flush, &info, 1);
+		struct flush_tlb_info *info;
+
+		preempt_disable();
+		info = get_flush_tlb_info(NULL, start, end, 0, false, 0);
+
+		on_each_cpu(do_kernel_range_flush, info, 1);
+
+		put_flush_tlb_info();
+		preempt_enable();
 	}
 }
 
+/*
+ * arch_tlbbatch_flush() performs a full TLB flush regardless of the active mm.
+ * This means that the 'struct flush_tlb_info' that describes which mappings to
+ * flush is actually fixed. We therefore set a single fixed struct and use it in
+ * arch_tlbbatch_flush().
+ */
+static const struct flush_tlb_info full_flush_tlb_info = {
+	.mm = NULL,
+	.start = 0,
+	.end = TLB_FLUSH_ALL,
+};
+
 void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 {
-	struct flush_tlb_info info = {
-		.mm = NULL,
-		.start = 0UL,
-		.end = TLB_FLUSH_ALL,
-	};
-
 	int cpu = get_cpu();
 
 	if (cpumask_test_cpu(cpu, &batch->cpumask)) {
-		VM_WARN_ON(irqs_disabled());
+		lockdep_assert_irqs_enabled();
 		local_irq_disable();
-		flush_tlb_func_local(&info, TLB_LOCAL_SHOOTDOWN);
+		flush_tlb_func_local(&full_flush_tlb_info, TLB_LOCAL_SHOOTDOWN);
 		local_irq_enable();
 	}
 
 	if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids)
-		flush_tlb_others(&batch->cpumask, &info);
+		flush_tlb_others(&batch->cpumask, &full_flush_tlb_info);
 
 	cpumask_clear(&batch->cpumask);
 

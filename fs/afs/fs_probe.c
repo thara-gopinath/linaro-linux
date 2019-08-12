@@ -1,12 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* AFS fileserver probing
  *
  * Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
  * Written by David Howells (dhowells@redhat.com)
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public Licence
- * as published by the Free Software Foundation; either version
- * 2 of the Licence, or (at your option) any later version.
  */
 
 #include <linux/sched.h>
@@ -33,8 +29,8 @@ static bool afs_fs_probe_done(struct afs_server *server)
 void afs_fileserver_probe_result(struct afs_call *call)
 {
 	struct afs_addr_list *alist = call->alist;
-	struct afs_server *server = call->reply[0];
-	unsigned int server_index = (long)call->reply[1];
+	struct afs_server *server = call->server;
+	unsigned int server_index = call->server_index;
 	unsigned int index = call->addr_ix;
 	unsigned int rtt = UINT_MAX;
 	bool have_result = false;
@@ -61,8 +57,11 @@ void afs_fileserver_probe_result(struct afs_call *call)
 		afs_io_error(call, afs_io_error_fs_probe_fail);
 		goto out;
 	case -ECONNRESET: /* Responded, but call expired. */
+	case -ERFKILL:
+	case -EADDRNOTAVAIL:
 	case -ENETUNREACH:
 	case -EHOSTUNREACH:
+	case -EHOSTDOWN:
 	case -ECONNREFUSED:
 	case -ETIMEDOUT:
 	case -ETIME:
@@ -132,12 +131,14 @@ out:
 static int afs_do_probe_fileserver(struct afs_net *net,
 				   struct afs_server *server,
 				   struct key *key,
-				   unsigned int server_index)
+				   unsigned int server_index,
+				   struct afs_error *_e)
 {
 	struct afs_addr_cursor ac = {
 		.index = 0,
 	};
-	int ret;
+	struct afs_call *call;
+	bool in_progress = false;
 
 	_enter("%pU", &server->uuid);
 
@@ -151,15 +152,18 @@ static int afs_do_probe_fileserver(struct afs_net *net,
 	server->probe.rtt = UINT_MAX;
 
 	for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++) {
-		ret = afs_fs_get_capabilities(net, server, &ac, key, server_index,
-					      true);
-		if (ret != -EINPROGRESS) {
-			afs_fs_probe_done(server);
-			return ret;
+		call = afs_fs_get_capabilities(net, server, &ac, key, server_index);
+		if (!IS_ERR(call)) {
+			afs_put_call(call);
+			in_progress = true;
+		} else {
+			afs_prioritise_error(_e, PTR_ERR(call), ac.abort_code);
 		}
 	}
 
-	return 0;
+	if (!in_progress)
+		afs_fs_probe_done(server);
+	return in_progress;
 }
 
 /*
@@ -169,21 +173,23 @@ int afs_probe_fileservers(struct afs_net *net, struct key *key,
 			  struct afs_server_list *list)
 {
 	struct afs_server *server;
-	int i, ret;
+	struct afs_error e;
+	bool in_progress = false;
+	int i;
 
+	e.error = 0;
+	e.responded = false;
 	for (i = 0; i < list->nr_servers; i++) {
 		server = list->servers[i].server;
 		if (test_bit(AFS_SERVER_FL_PROBED, &server->flags))
 			continue;
 
-		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags)) {
-			ret = afs_do_probe_fileserver(net, server, key, i);
-			if (ret)
-				return ret;
-		}
+		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags) &&
+		    afs_do_probe_fileserver(net, server, key, i, &e))
+			in_progress = true;
 	}
 
-	return 0;
+	return in_progress ? 0 : e.error;
 }
 
 /*
@@ -238,7 +244,7 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
 			}
 		}
 
-		if (!still_probing || unlikely(signal_pending(current)))
+		if (!still_probing || signal_pending(current))
 			goto stop;
 		schedule();
 	}
