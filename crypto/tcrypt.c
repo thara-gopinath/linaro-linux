@@ -1671,6 +1671,22 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 	int ret = 0;
 
 	switch (m) {
+	case -1:
+		if (!alg) {
+			ret = -EINVAL;
+			break;
+		} else {
+			char *alg_str, *alg_token;
+
+			alg_str = kstrndup(alg, PAGE_SIZE, GFP_KERNEL);
+		        if (!alg_str) {
+		                ret = -ENOMEM;
+				break;
+			}
+			while ((alg_token = strsep(&alg_str, ":")))
+				ret += tcrypt_test(alg_token);
+		}
+		break;
 	case 0:
 		if (alg) {
 			if (!crypto_has_alg(alg, type,
