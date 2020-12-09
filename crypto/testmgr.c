@@ -1142,9 +1142,41 @@ static int check_hash_result(const char *type,
 			     const char *driver,
 			     const struct testvec_config *cfg)
 {
+	int i;
+
 	if (memcmp(result, vec->digest, digestsize) != 0) {
 		pr_err("alg: %s: %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
 		       type, driver, vec_name, cfg->name);
+		pr_err("Plain Text :\n");
+		if (vec->psize != 0)
+			pr_err("/x%02x ",vec->plaintext[0]);
+		else
+			pr_err("Empty plain text\n");
+		for(i=1;i<vec->psize;i++)
+			pr_cont("/x%02x ",vec->plaintext[i]);
+		pr_err("\n");
+
+		pr_err("Key :\n");
+		if (vec->ksize != 0)
+			pr_err("/x%02x ",vec->key[0]);
+		else
+			pr_err("Empty Key\n");
+		for(i=1;i<vec->ksize;i++)
+			pr_cont("/x%02x ",vec->key[i]);
+		pr_err("\n");
+
+		pr_err("Digest obtained :\n");
+		pr_err("/x%x ",result[0]);
+		for(i=1; i<digestsize; i++)
+			pr_cont("/x%x ",result[i]);
+		pr_err("\n");
+
+		pr_err("Expected Digest :\n");
+		pr_err("/x%x ",vec->digest[0]);
+		for(i=1; i<digestsize; i++)
+			pr_cont("/x%x ",vec->digest[i]);
+		pr_err("\n");
+
 		return -EINVAL;
 	}
 	if (!testmgr_is_poison(&result[digestsize], TESTMGR_POISON_LEN)) {
@@ -1736,8 +1768,9 @@ static int test_hash_vs_generic_impl(const char *generic_driver,
 					     vec_name, sizeof(vec_name));
 		generate_random_testvec_config(cfg, cfgname, sizeof(cfgname));
 
-		err = test_hash_vec_cfg(&vec, vec_name, cfg,
-					req, desc, tsgl, hashstate);
+		if (vec.psize != 0)
+			err = test_hash_vec_cfg(&vec, vec_name, cfg,
+						req, desc, tsgl, hashstate);
 		if (err)
 			goto out;
 		cond_resched();
@@ -2710,7 +2743,7 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 		 cfg->iv_offset +
 		 (cfg->iv_offset_relative_to_alignmask ? alignmask : 0);
 	struct kvec input;
-	int err;
+	int err = 0, i;
 
 	pr_info("alg: skcipher: %s Testing(%s) test vector %s, cfg=\"%s\"\n",
 		 tfm->base.__crt_alg->cra_driver_name, op, vec_name, cfg->name);
@@ -2729,7 +2762,7 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 		pr_err("alg: skcipher: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
 		       driver, vec_name, vec->setkey_error, err,
 		       crypto_skcipher_get_flags(tfm));
-		return err;
+		return 0;
 	}
 	if (vec->setkey_error) {
 		pr_err("alg: skcipher: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
@@ -2806,18 +2839,21 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 			pr_err("alg: skcipher: changed 'req->base.flags'\n");
 		if (req->base.data != &wait)
 			pr_err("alg: skcipher: changed 'req->base.data'\n");
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 	if (is_test_sglist_corrupted(&tsgls->src)) {
 		pr_err("alg: skcipher: %s %s corrupted src sgl on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return -EINVAL;
+		err =  -EINVAL;
+		goto dump_debug_info;
 	}
 	if (tsgls->dst.sgl_ptr != tsgls->src.sgl &&
 	    is_test_sglist_corrupted(&tsgls->dst)) {
 		pr_err("alg: skcipher: %s %s corrupted dst sgl on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 
 	/* Check for success or failure */
@@ -2826,12 +2862,13 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 			return 0;
 		pr_err("alg: skcipher: %s %s failed on test vector %s; expected_error=%d, actual_error=%d, cfg=\"%s\"\n",
 		       driver, op, vec_name, vec->crypt_error, err, cfg->name);
-		return err;
+		goto dump_debug_info;
 	}
 	if (vec->crypt_error) {
 		pr_err("alg: skcipher: %s %s unexpectedly succeeded on test vector %s; expected_error=%d, cfg=\"%s\"\n",
 		       driver, op, vec_name, vec->crypt_error, cfg->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 
 	/* Check for the correct output (ciphertext or plaintext) */
@@ -2840,12 +2877,12 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 	if (err == -EOVERFLOW) {
 		pr_err("alg: skcipher: %s %s overran dst buffer on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return err;
+		goto dump_debug_info;
 	}
 	if (err) {
 		pr_err("alg: skcipher: %s %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return err;
+		goto dump_debug_info;
 	}
 
 	/* If applicable, check that the algorithm generated the correct IV */
@@ -2853,11 +2890,51 @@ static int test_skcipher_vec_cfg(int enc, const struct cipher_testvec *vec,
 		pr_err("alg: skcipher: %s %s test failed (wrong output IV) on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
 		hexdump(iv, ivsize);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 
 	pr_info("Test Passed\n");
 	return 0;
+
+dump_debug_info:
+		pr_err("Key :\n");
+		if (vec->klen != 0)
+			pr_err("/x%02x ",vec->key[0]);
+		else
+			pr_err("Empty Key\n");
+		for(i=1;i<vec->klen;i++)
+			pr_cont("/x%02x ",vec->key[i]);
+		pr_err("\n");
+
+		pr_err("IV :\n");
+		if (ivsize)
+			pr_err("/x%02x ",vec->iv[0]);
+		else
+			pr_err("No IV\n");
+		for(i=1;i<ivsize;i++)
+			pr_cont("/x%02x ",vec->iv[i]);
+		pr_err("\n");
+
+		pr_err("Plain Text :\n");
+		if (vec->len)
+			pr_err("/x%02x ",vec->ptext[0]);
+		else
+			pr_err("Empty plain text\n");
+		for(i=1;i<vec->len;i++)
+			pr_cont("/x%02x ",vec->ptext[i]);
+		pr_err("\n");
+
+		pr_err("Cipher Text :\n");
+		if (vec->len)
+			pr_err("/x%02x ",vec->ctext[0]);
+		else
+			pr_err("Empty cipher text\n");
+		for(i=1;i<vec->len;i++)
+			pr_cont("/x%02x ",vec->ctext[i]);
+		pr_err("\n");
+
+		return err;
 }
 
 static int test_skcipher_vec(int enc, const struct cipher_testvec *vec,
@@ -3077,6 +3154,8 @@ static int test_skcipher_vs_generic_impl(const char *generic_driver,
 					       vec_name, sizeof(vec_name));
 		generate_random_testvec_config(cfg, cfgname, sizeof(cfgname));
 
+		if (!vec.len)
+			continue;
 		err = test_skcipher_vec_cfg(ENCRYPT, &vec, vec_name,
 					    cfg, req, tsgls);
 		if (err)
