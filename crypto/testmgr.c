@@ -1978,7 +1978,10 @@ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
 		 cfg->iv_offset +
 		 (cfg->iv_offset_relative_to_alignmask ? alignmask : 0);
 	struct kvec input[2];
-	int err;
+	int err, i;
+
+	pr_info("alg: aead: %s Testing(%s) test vector %s, cfg=\"%s\"\n",
+		tfm->base.__crt_alg->cra_driver_name, op, vec_name, cfg->name);
 
 	/* Set the key */
 	if (vec->wk)
@@ -1992,7 +1995,9 @@ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
 		pr_err("alg: aead: %s setkey failed on test vector %s; expected_error=%d, actual_error=%d, flags=%#x\n",
 		       driver, vec_name, vec->setkey_error, err,
 		       crypto_aead_get_flags(tfm));
-		return err;
+		if (err == -EINVAL)
+			return 0;
+		goto dump_debug_info;
 	}
 	if (!err && vec->setkey_error) {
 		pr_err("alg: aead: %s setkey unexpectedly succeeded on test vector %s; expected_error=%d\n",
@@ -2084,18 +2089,21 @@ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
 			pr_err("alg: aead: changed 'req->base.flags'\n");
 		if (req->base.data != &wait)
 			pr_err("alg: aead: changed 'req->base.data'\n");
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 	if (is_test_sglist_corrupted(&tsgls->src)) {
 		pr_err("alg: aead: %s %s corrupted src sgl on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 	if (tsgls->dst.sgl_ptr != tsgls->src.sgl &&
 	    is_test_sglist_corrupted(&tsgls->dst)) {
 		pr_err("alg: aead: %s %s corrupted dst sgl on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 
 	/* Check for unexpected success or failure, or wrong error code */
@@ -2115,11 +2123,12 @@ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
 			pr_err("alg: aead: %s %s failed on test vector %s; expected_error=%s, actual_error=%d, cfg=\"%s\"\n",
 			       driver, op, vec_name, expected_error, err,
 			       cfg->name);
-			return err;
+			goto dump_debug_info;
 		}
 		pr_err("alg: aead: %s %s unexpectedly succeeded on test vector %s; expected_error=%s, cfg=\"%s\"\n",
 		       driver, op, vec_name, expected_error, cfg->name);
-		return -EINVAL;
+		err = -EINVAL;
+		goto dump_debug_info;
 	}
 	if (err) /* Expectedly failed. */
 		return 0;
@@ -2131,15 +2140,65 @@ static int test_aead_vec_cfg(int enc, const struct aead_testvec *vec,
 	if (err == -EOVERFLOW) {
 		pr_err("alg: aead: %s %s overran dst buffer on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return err;
+		goto dump_debug_info;
 	}
 	if (err) {
 		pr_err("alg: aead: %s %s test failed (wrong result) on test vector %s, cfg=\"%s\"\n",
 		       driver, op, vec_name, cfg->name);
-		return err;
+		goto dump_debug_info;
 	}
 
+	pr_info("Test Passed\n");
+
 	return 0;
+
+dump_debug_info:
+		pr_err("Key :\n");
+		if (vec->klen != 0)
+			pr_err("/x%02x ",vec->key[0]);
+		else
+			pr_err("Empty Key\n");
+		for(i=1;i<vec->klen;i++)
+			pr_cont("/x%02x ",vec->key[i]);
+		pr_err("\n");
+
+		pr_err("IV :\n");
+		if (ivsize)
+			pr_err("/x%02x ",vec->iv[0]);
+		else
+			pr_err("No IV\n");
+		for(i=1;i<ivsize;i++)
+			pr_cont("/x%02x ",vec->iv[i]);
+		pr_err("\n");
+
+		pr_err("Plain Text :\n");
+		if (vec->plen)
+			pr_err("/x%02x ",vec->ptext[0]);
+		else
+			pr_err("Empty plain text\n");
+		for(i=1;i<vec->plen;i++)
+			pr_cont("/x%02x ",vec->ptext[i]);
+		pr_err("\n");
+
+		pr_err("Cipher Text :\n");
+		if (vec->clen)
+			pr_err("/x%02x ",vec->ctext[0]);
+		else
+			pr_err("Empty cipher text\n");
+		for(i=1;i<vec->clen;i++)
+			pr_cont("/x%02x ",vec->ctext[i]);
+		pr_err("\n");
+
+		pr_err("Associated data :\n");
+		if (vec->alen)
+			pr_err("/x%02x ",vec->assoc[0]);
+		else
+			pr_err("Empty associated data\n");
+		for(i=1;i<vec->alen;i++)
+			pr_cont("/x%02x ",vec->assoc[i]);
+		pr_err("\n");
+
+		return err;
 }
 
 static int test_aead_vec(int enc, const struct aead_testvec *vec,
@@ -4274,20 +4333,29 @@ static const struct alg_test_desc alg_test_descs[] = {
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
-			.aead = __VECS(hmac_sha1_aes_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha1_aes_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha1),cbc(des))",
 		.test = alg_test_aead,
 		.suite = {
-			.aead = __VECS(hmac_sha1_des_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha1_des_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha1),cbc(des3_ede))",
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
-			.aead = __VECS(hmac_sha1_des3_ede_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha1_des3_ede_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha1),ctr(aes))",
@@ -4321,20 +4389,29 @@ static const struct alg_test_desc alg_test_descs[] = {
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
-			.aead = __VECS(hmac_sha256_aes_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha256_aes_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha256),cbc(des))",
 		.test = alg_test_aead,
 		.suite = {
-			.aead = __VECS(hmac_sha256_des_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha256_des_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha256),cbc(des3_ede))",
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
-			.aead = __VECS(hmac_sha256_des3_ede_cbc_tv_temp)
+			.aead = {
+				____VECS(hmac_sha256_des3_ede_cbc_tv_temp),
+				.einval_allowed = 1,
+			}
 		}
 	}, {
 		.alg = "authenc(hmac(sha256),ctr(aes))",
