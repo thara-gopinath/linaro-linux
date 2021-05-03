@@ -897,6 +897,69 @@ int qcom_scm_assign_mem(phys_addr_t mem_addr, size_t mem_sz,
 EXPORT_SYMBOL(qcom_scm_assign_mem);
 
 /**
+ * The following shmbridge functions should be called before the SCM driver
+ * has been initialized. If not, there could be errors that might cause the
+ * system to crash.
+ */
+int qcom_scm_enable_shm_bridge(void)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+	struct qcom_scm_res res;
+
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
+
+	return ret ? : res.result[0];
+}
+EXPORT_SYMBOL(qcom_scm_enable_shm_bridge);
+
+int qcom_scm_delete_shm_bridge(u64 handle)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRIDGE_DELETE,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+
+	desc.args[0] = handle;
+	desc.arginfo = QCOM_SCM_ARGS(1, QCOM_SCM_VAL);
+
+	return qcom_scm_call(__scm->dev, &desc, NULL);
+}
+EXPORT_SYMBOL(qcom_scm_delete_shm_bridge);
+
+int qcom_scm_create_shm_bridge(u64 pfn_and_ns_perm_flags, u64 ipfn_and_s_perm_flags,
+			       u64 size_and_flags, u64 ns_vmids, u64 *handle)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_SHM_BRDIGE_CREATE,
+		.owner = ARM_SMCCC_OWNER_SIP
+	};
+	struct qcom_scm_res res;
+
+	desc.args[0] = pfn_and_ns_perm_flags;
+	desc.args[1] = ipfn_and_s_perm_flags;
+	desc.args[2] = size_and_flags;
+	desc.args[3] = ns_vmids;
+
+	desc.arginfo = QCOM_SCM_ARGS(4, QCOM_SCM_VAL, QCOM_SCM_VAL, QCOM_SCM_VAL, QCOM_SCM_VAL);
+
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
+
+	if (handle)
+		*handle = res.result[1];
+
+	return ret ? : res.result[0];
+}
+EXPORT_SYMBOL(qcom_scm_create_shm_bridge);
+
+/**
  * qcom_scm_ocmem_lock_available() - is OCMEM lock/unlock interface available
  */
 bool qcom_scm_ocmem_lock_available(void)
