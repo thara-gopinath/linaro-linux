@@ -264,6 +264,10 @@
 			compatible = "qcom,scm";
 			#reset-cells = <1>;
 		};
+		smcinvoke: smcinvoke {
+			compatible = "qcom,smcinvoke";
+			qcom,support-hypervisor = <1>;
+		};
 	};
 
 	memory@80000000 {
