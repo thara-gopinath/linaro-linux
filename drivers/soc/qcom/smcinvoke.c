@@ -1155,7 +1155,8 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 				size_t out_buf_len,
 				struct smcinvoke_cmd_req *req,
 				union smcinvoke_arg *args_buf,
-				bool *tz_acked)
+				bool *tz_acked,
+				struct qtee_shm *in_shm,struct  qtee_shm *out_shm)
 {
 	int ret = 0, cmd;
 	u64 response_type;
@@ -1187,7 +1188,10 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 			ret = qcom_scm_invoke_smc_legacy(in_paddr, in_buf_len,
 					out_paddr, out_buf_len,
 					&req->result, &response_type, &data);
-		else*/ if (cmd == SMCINVOKE_INVOKE_CMD)
+		else*/
+		qtee_shmbridge_flush_shm_buf(in_shm);
+		qtee_shmbridge_flush_shm_buf(out_shm);
+		 if (cmd == SMCINVOKE_INVOKE_CMD)
 			ret = qcom_scm_invoke_smc(in_paddr, in_buf_len,
 					out_paddr, out_buf_len,
 					&req->result, &response_type, &data);
@@ -1195,6 +1199,9 @@ static int prepare_send_scm_msg(const uint8_t *in_buf, phys_addr_t in_paddr,
 			ret = qcom_scm_invoke_callback_response(
 					virt_to_phys(out_buf), out_buf_len,
 					&req->result, &response_type, &data);
+
+		qtee_shmbridge_inv_shm_buf(in_shm);
+		qtee_shmbridge_inv_shm_buf(out_shm);
 
 		if (!ret && !is_inbound_req(response_type)) {
 			/* dont marshal if Obj returns an error */
@@ -1816,10 +1823,11 @@ static long process_invoke_req(struct file *filp, unsigned int cmd,
 		pr_err("failed to marshal in invoke req, ret :%d\n", ret);
 		goto out;
 	}
-
+	//pr_err("in_msg-> tzhandle:%d",(struct smcinvoke_msg_hdr)in_msg->tzhandle);
+	
 	ret = prepare_send_scm_msg(in_msg, in_shm.paddr, inmsg_size,
 					out_msg, out_shm.paddr, outmsg_size,
-					&req, args_buf, &tz_acked);
+					&req, args_buf, &tz_acked, &in_shm, &out_shm);
 
 	/*
 	 * If scm_call is success, TZ owns responsibility to release
@@ -1963,7 +1971,8 @@ static int smcinvoke_release(struct inode *nodp, struct file *filp)
 
 	ret = prepare_send_scm_msg(in_buf, in_shm.paddr,
 		SMCINVOKE_TZ_MIN_BUF_SIZE, out_buf, out_shm.paddr,
-		SMCINVOKE_TZ_MIN_BUF_SIZE, &req, NULL, &release_handles);
+		SMCINVOKE_TZ_MIN_BUF_SIZE, &req, NULL, &release_handles,
+		&in_shm, &out_shm);
 
 	process_piggyback_data(out_buf, SMCINVOKE_TZ_MIN_BUF_SIZE);
 out:

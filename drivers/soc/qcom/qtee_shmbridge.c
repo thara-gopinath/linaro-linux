@@ -412,6 +412,7 @@ int qtee_shmbridge_init(struct device *dev, bool is_hyp_suppported)
 		ret = 0;
 		goto exit;
 	}
+	pr_err("shmbridge is enabled on tz side.");
 
 	/*register default bridge*/
 	if (support_hyp)
