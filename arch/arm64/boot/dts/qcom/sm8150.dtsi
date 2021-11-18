@@ -583,6 +583,10 @@
 			compatible = "qcom,scm-sm8150", "qcom,scm";
 			#reset-cells = <1>;
 		};
+		smcinvoke: smcinvoke {
+			compatible = "qcom,smcinvoke";
+			qcom,support-hypervisor = <1>;
+		};
 	};
 
 	tcsr_mutex: hwlock {
