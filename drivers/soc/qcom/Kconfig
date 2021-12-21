@@ -228,4 +228,13 @@ config QCOM_APR
 	  application processor and QDSP6. APR is
 	  used by audio driver to configure QDSP6
 	  ASM, ADM and AFE modules.
+
+config QCOM_ICC_BWMON
+	tristate "QCOM DDR Bandwidth Monitoring support"
+	depends on ARCH_QCOM
+        select PM_OPP
+	help
+	  Sets up bandwidth monitoring between various clients and ddr
+	  and bumps up the interconnect speeds based on the values read from
+	  counters.
 endmenu
